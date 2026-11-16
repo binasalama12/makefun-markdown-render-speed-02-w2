@@ -13,6 +13,11 @@ import { decodeEntityBody } from './entities.js';
 /* ------------------------------------------------------------------ */
 
 const PUNCT_RE = /[!-\/:-@\[-`{-~]/;
+const UNI_PUNCT_RE = /[\p{P}\p{S}]/u;
+
+function isUniPunct(ch) {
+  return ch !== undefined && ch !== '' && UNI_PUNCT_RE.test(ch);
+}
 
 function isPunct(ch) {
   return ch !== undefined && ch !== '' && PUNCT_RE.test(ch);
@@ -186,10 +191,10 @@ function isBlank(line) {
 
 function normalizeLabel(label) {
   return label
-    .replace(/\\([!-\/:-@\[-`{-~])/g, '$1')
     .replace(/\s+/g, ' ')
     .trim()
-    .toLowerCase();
+    .toLowerCase()
+    .replace(/ß/g, 'ss');
 }
 
 // Parse a destination starting at src[pos]: <angle> or bare-with-parens.
@@ -479,6 +484,24 @@ function findCloseBracket(src, start) {
       if (closed) { i = j; continue; }
       continue;
     }
+    if (ch === '<') {
+      // skip tags / autolinks: a ']' inside one is not a bracket
+      let j = i + 1;
+      let quote = null;
+      let closed = false;
+      while (j < src.length) {
+        const cj = src[j];
+        if (quote) {
+          if (cj === quote) quote = null;
+        } else if (cj === '"' || cj === "'") quote = cj;
+        else if (cj === '>') { closed = true; break; }
+        else if (cj === '<') break;
+        j += 1;
+      }
+      if (closed) { i = j + 1; continue; }
+      i += 1;
+      continue;
+    }
     if (ch === '[') depth += 1;
     else if (ch === ']') {
       depth -= 1;
@@ -493,8 +516,19 @@ function findCloseBracket(src, start) {
 // Returns { href, title, next } or null.
 function parseInlineLinkTail(src, pos) {
   let i = skipInlineWs(src, pos + 1);
+  if (src[i] === ')') return { href: '', title: null, next: i + 1 };
   const dest = parseDestAt(src, i);
-  if (!dest) return null;
+  if (!dest) {
+    // empty destination with just a title: [a]( "t")
+    if (src[i] === '"' || src[i] === "'" || src[i] === '(') {
+      const t = parseTitleAt(src, i);
+      if (t) {
+        const j = skipInlineWs(src, t.next);
+        if (src[j] === ')') return { href: '', title: t.title, next: j + 1 };
+      }
+    }
+    return null;
+  }
   i = dest.next;
   const afterDest = i;
   i = skipInlineWs(src, i);
@@ -519,6 +553,7 @@ function linkOpenTag(href, title) {
 
 function plainTextOf(html) {
   return html
+    .replace(/<img[^>]*? alt="([^"]*)"[^>]*>/g, '$1')
     .replace(/<[^>]*>/g, '')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
@@ -527,13 +562,46 @@ function plainTextOf(html) {
     .replace(/&amp;/g, '&');
 }
 
+// Does this label itself contain a complete link? If so the outer link
+// must not form (links may not nest); images are exempt.
+function labelHasLink(labelSrc, ctx) {
+  for (let k = 0; k < labelSrc.length; k++) {
+    const c = labelSrc[k];
+    if (c === '\\') { k += 1; continue; }
+    if (c === '`') {
+      let run = 0;
+      while (labelSrc[k] === '`') { run += 1; k += 1; }
+      let j = k;
+      while (j < labelSrc.length) {
+        if (labelSrc[j] === '`') {
+          let r2 = 0;
+          while (labelSrc[j] === '`') { r2 += 1; j += 1; }
+          if (r2 === run) break;
+        } else j += 1;
+      }
+      k = j - 1;
+      continue;
+    }
+    if (c === '!' && labelSrc[k + 1] === '[') {
+      // an image inside the label is fine; skip over it
+      const img = tryLink(labelSrc, k, ctx, true, true);
+      if (img) { k = img.next - 1; continue; }
+    }
+    if (c === '[') {
+      if (tryLink(labelSrc, k, ctx, false, true)) return true;
+    }
+  }
+  return false;
+}
+
 // Try to build a link or image whose '[' sits at src[start] (for images,
 // start points at '!'). Returns { html, next } or null.
-function tryLink(src, start, ctx, isImage) {
+function tryLink(src, start, ctx, isImage, probe) {
   const bracketAt = isImage ? start + 1 : start;
   const close = findCloseBracket(src, bracketAt);
   if (close < 0) return null;
   const labelSrc = src.slice(bracketAt + 1, close);
+  if (!probe && !isImage && labelHasLink(labelSrc, ctx)) return null;
   let href = null;
   let title = null;
   let next = -1;
@@ -556,6 +624,9 @@ function tryLink(src, start, ctx, isImage) {
         href = def.href;
         title = def.title;
         next = close2 + 1;
+      } else {
+        // a following label rules out the shortcut interpretation
+        return null;
       }
     }
   }
@@ -570,7 +641,7 @@ function tryLink(src, start, ctx, isImage) {
   }
   if (next < 0) return null;
   if (isImage) {
-    const altHtml = renderInline(labelSrc, { refs: ctx.refs, inLink: true, noAutolink: true });
+    const altHtml = renderInline(labelSrc, { refs: ctx.refs, inLink: false, noAutolink: true });
     let s =
       '<img src="' + escapeAttr(cleanUrl(href)) +
       '" alt="' + escapeAttr(plainTextOf(altHtml)) + '"';
@@ -774,13 +845,13 @@ function renderInline(src, ctx) {
         continue;
       }
       const nextCh = i < n ? src[i] : undefined;
-      const leftFlank = !isSpaceCh(nextCh) && (!isPunct(nextCh) || isSpaceCh(prev) || isPunct(prev));
-      const rightFlank = !isSpaceCh(prev) && (!isPunct(prev) || isSpaceCh(nextCh) || isPunct(nextCh));
+      const leftFlank = !isSpaceCh(nextCh) && (!isUniPunct(nextCh) || isSpaceCh(prev) || isUniPunct(prev));
+      const rightFlank = !isSpaceCh(prev) && (!isUniPunct(prev) || isSpaceCh(nextCh) || isUniPunct(nextCh));
       let canOpen;
       let canClose;
       if (ch === '_') {
-        canOpen = leftFlank && (!rightFlank || isPunct(prev));
-        canClose = rightFlank && (!leftFlank || isPunct(nextCh));
+        canOpen = leftFlank && (!rightFlank || isUniPunct(prev));
+        canClose = rightFlank && (!leftFlank || isUniPunct(nextCh));
       } else {
         canOpen = leftFlank;
         canClose = rightFlank;
@@ -1339,17 +1410,34 @@ const BLOCK_CLOSE_RE = /\/(?:ul|ol|blockquote|pre|table|p|h[1-6]|li)>$|<hr>$/;
 function itemLoose(itemLines) {
   const stack = []; // content indents of open nested containers
   let seenBlank = false;
+  let seenContent = false;
+  let fenceCh = null;
+  let fenceLen = 0;
   for (const l of itemLines) {
-    if (isBlank(l)) {
-      seenBlank = true;
+    if (fenceCh !== null) {
+      const ind = indentInfo(l, 4);
+      const rest = ind.cols < 4 ? l.slice(ind.pos) : '';
+      const cm = FENCE_RE.exec(rest);
+      if (cm && cm[1][0] === fenceCh && cm[1].length >= fenceLen) fenceCh = null;
       continue;
     }
-    const ind = indentInfo(l, 4).cols;
+    if (isBlank(l)) {
+      if (seenContent) seenBlank = true;
+      continue;
+    }
+    seenContent = true;
+    const ind = indentInfo(l, 4);
+    const rest = ind.cols < 4 ? l.slice(ind.pos) : '';
+    const fm = FENCE_RE.exec(rest);
+    if (fm && !(fm[1][0] === '`' && fm[2].includes('`'))) {
+      fenceCh = fm[1][0];
+      fenceLen = fm[1].length;
+    }
     if (seenBlank) {
-      if (!(stack.length && ind >= stack[stack.length - 1])) return true;
+      if (!(stack.length && ind.cols >= stack[stack.length - 1])) return true;
       seenBlank = false;
     }
-    while (stack.length && ind < stack[stack.length - 1]) stack.pop();
+    while (stack.length && ind.cols < stack[stack.length - 1]) stack.pop();
     const base = stack.length ? stack[stack.length - 1] : 0;
     const rel = stripIndent(l, base);
     const mk = matchListMarker(rel);
@@ -1378,11 +1466,14 @@ function renderList(lines, start, ctx) {
   const sameMarker = (mk) =>
     mk && mk.ordered === ordered &&
     (ordered ? mk.delim === delim : mk.bullet === bullet);
+  // A sibling marker may wander at most three columns from the first
+  // item's marker; anything deeper is content, not a new item.
+  const siblingOk = (mk) => sameMarker(mk) && mk.indentCols <= first.indentCols + 3;
 
   while (i < lines.length) {
     if (items.length > 0 && isHrLine(lines[i])) break;
     const mk = matchListMarker(lines[i]);
-    if (!sameMarker(mk)) break;
+    if (!siblingOk(mk)) break;
     const contentCols = mk.contentCols;
     const itemLines = [];
     // first line: content after the marker
@@ -1392,10 +1483,16 @@ function renderList(lines, start, ctx) {
     let endedByBlankRun = false;
     let stopAfterItem = false;
     // An item whose first line is empty ends at once if a blank line
-    // follows: content after that blank belongs to a new block.
+    // follows and no further item of this list comes after the blank:
+    // content after that blank belongs to a new block.
     if (mk.empty && i < lines.length && isBlank(lines[i])) {
-      items.push(itemLines);
-      break;
+      let j = i;
+      while (j < lines.length && isBlank(lines[j])) j += 1;
+      const nmk = j < lines.length && !isHrLine(lines[j]) ? matchListMarker(lines[j]) : null;
+      if (!siblingOk(nmk)) {
+        items.push(itemLines);
+        break;
+      }
     }
     while (i < lines.length) {
       const l2 = lines[i];
@@ -1407,7 +1504,7 @@ function renderList(lines, start, ctx) {
         if (j >= lines.length) { i = j; endedByBlankRun = true; break; }
         const nextMk = isHrLine(lines[j]) ? null : matchListMarker(lines[j]);
         const nextInd = indentInfo(lines[j], 4);
-        if (sameMarker(nextMk) && nextMk.indentCols < contentCols) {
+        if (siblingOk(nextMk) && nextMk.indentCols < contentCols) {
           if (blanks >= 1) looseBetween = true;
           i = j;
           itemBlankSeen = true;
@@ -1430,7 +1527,7 @@ function renderList(lines, start, ctx) {
       }
       const ind2 = indentInfo(l2, 4);
       const mk2 = isHrLine(l2) ? null : matchListMarker(l2);
-      if (sameMarker(mk2) && mk2.indentCols < contentCols && ind2.cols < contentCols) {
+      if (siblingOk(mk2) && mk2.indentCols < contentCols && ind2.cols < contentCols) {
         break; // next item
       }
       if (ind2.cols >= contentCols) {
@@ -1460,7 +1557,7 @@ function renderList(lines, start, ctx) {
     if (i < lines.length) {
       if (isHrLine(lines[i])) break;
       const nmk = matchListMarker(lines[i]);
-      if (!sameMarker(nmk)) break;
+      if (!siblingOk(nmk)) break;
     }
   }
 
