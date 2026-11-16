@@ -28,6 +28,12 @@ namedEntities['UnderBar'] = '_';
 namedEntities['hyphen'] = '‐';
 namedEntities['fjlig'] = 'fj';
 namedEntities['ThickSpace'] = '  ';
+// Symbols and miscellaneous references that round out the compact table.
+namedEntities['check'] = '✓';
+namedEntities['cross'] = '✗';
+namedEntities['star'] = '☆';
+namedEntities['phone'] = '☎';
+namedEntities['commat'] = '@';
 namedEntities['nbsp'] = ' ';
 namedEntities['ensp'] = ' ';
 namedEntities['emsp'] = ' ';

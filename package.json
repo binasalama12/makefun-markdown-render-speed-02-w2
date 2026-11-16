@@ -1,1 +1,1 @@
-{"name":"streammark-w2","private":true,"type":"module"}
+{"description":"Dependency-free single-pass streaming Markdown-to-HTML renderer (CommonMark + GFM) with a Node driver for batch case files.","name":"streammark-w2","private":true,"type":"module"}
