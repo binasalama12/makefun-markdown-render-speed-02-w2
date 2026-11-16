@@ -138,16 +138,6 @@ function stripIndent(line, cols) {
       break;
     }
   }
-  if (pos > 0) {
-    let abs = col;
-    let out = '';
-    let p = pos;
-    while (p < line.length && (line[p] === ' ' || line[p] === '\t')) {
-      if (line[p] === ' ') { out += ' '; abs += 1; p += 1; }
-      else { const w2 = 4 - (abs % 4); out += ' '.repeat(w2); abs += w2; p += 1; }
-    }
-    return out + line.slice(p);
-  }
   return line.slice(pos);
 }
 
@@ -362,6 +352,22 @@ function quoteStripAll(line) {
   return cur;
 }
 
+// Fence detection for the pre-scan: tolerant of fences nested inside
+// blockquotes and list items, which the scan does not otherwise track.
+function fenceOf(line) {
+  const s = quoteStripAll(line);
+  const ind = indentInfo(s, 4);
+  if (ind.cols >= 4) return null;
+  const rest = s.slice(ind.pos);
+  const mk = matchListMarker(s);
+  const cand = mk ? mk.contentStr : rest;
+  const m = FENCE_RE.exec(cand);
+  if (m && !(m[1][0] === '`' && m[2].includes('`'))) {
+    return { ch: m[1][0], len: m[1].length };
+  }
+  return null;
+}
+
 // Pre-scan: definitions are visible to links that precede them, so gather
 // top-level definitions up front (skipping fenced code regions). A
 // definition-shaped line that merely continues a paragraph does not
@@ -374,14 +380,14 @@ function prescanDefs(lines, refs) {
     if (isBlank(line)) { prevPara = false; continue; }
     const ind = indentInfo(line, 4);
     const rest = ind.cols < 4 ? line.slice(ind.pos) : '';
-    const fm = /^(`{3,}|~{3,})/.exec(rest);
+    const fm = fenceOf(line);
     if (inFence) {
-      if (fm && fm[1][0] === inFence.ch && fm[1].length >= inFence.len) inFence = null;
+      if (fm && fm.ch === inFence.ch && fm.len >= inFence.len) inFence = null;
       prevPara = false;
       continue;
     }
-    if (fm && !(fm[1][0] === '`' && rest.slice(fm[1].length).includes('`'))) {
-      inFence = { ch: fm[1][0], len: fm[1].length };
+    if (fm) {
+      inFence = fm;
       prevPara = false;
       continue;
     }
@@ -430,8 +436,8 @@ const SCHEME_AUTOLINK = /^<([a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^<>\s]*)>/;
 const EMAIL_AUTOLINK =
   /^<([a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)+)>/;
 const HTML_TAG_AT =
-  /^<\/?[a-zA-Z][a-zA-Z0-9-]*(?:[ \t\n]+[a-zA-Z_:][a-zA-Z0-9_.:-]*(?:[ \t\n]*=[ \t\n]*(?:[^ \t\n"'=<>\`]+|'[^']*'|"[^"]*"))?)*[ \t\n]*\/?>/;
-const BARE_URL_AT = /^(?:https?:\/\/|www\.)[^\s<]+/;
+  /^(?:<[a-zA-Z][a-zA-Z0-9-]*(?:[ \t\n]+[a-zA-Z_:][a-zA-Z0-9_.:-]*(?:[ \t\n]*=[ \t\n]*(?:[^ \t\n"'=<>\`]+|'[^']*'|"[^"]*"))?)*[ \t\n]*\/?>|<\/[a-zA-Z][a-zA-Z0-9-]*[ \t\n]*>)/;
+const BARE_URL_AT = /^(?:https?:\/\/|www\.)[^\s<]+/i;
 const BARE_EMAIL_AT =
   /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)+/;
 
@@ -442,9 +448,7 @@ function trimBareUrl(url) {
   for (;;) {
     const before = u;
     u = u.replace(/[?!,.:*_~]+$/, '');
-    u = u.replace(/&[a-zA-Z][a-zA-Z0-9]*;$/, (m) =>
-      decodeEntityBody(m.slice(1, -1)) !== undefined ? '' : m,
-    );
+    u = u.replace(/&(?:#\d+|#[xX][0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);$/, '');
     for (const [open, close] of [['(', ')'], ['[', ']'], ['{', '}']]) {
       while (u.endsWith(close)) {
         const opens = u.split(open).length - 1;
@@ -681,6 +685,7 @@ function renderInline(src, ctx) {
         flush();
         nodes.push({ k: 'raw', s: '<br>' });
         i += 2;
+        while (src[i] === ' ' || src[i] === '\t') i += 1;
         continue;
       }
       if (nx !== undefined && isPunct(nx)) {
@@ -702,6 +707,9 @@ function renderInline(src, ctx) {
         buf = buf.slice(0, buf.length - m[0].length);
         flush();
         nodes.push({ k: 'raw', s: '<br>' });
+        i += 1;
+        while (src[i] === ' ' || src[i] === '\t') i += 1;
+        continue;
       } else {
         buf += '\n';
       }
@@ -781,7 +789,7 @@ function renderInline(src, ctx) {
         continue;
       }
       if (rest.startsWith('<!--')) {
-        const end = rest.indexOf('-->', 4);
+        const end = rest.indexOf('-->', 2);
         if (end >= 0) {
           pushRaw(rest.slice(0, end + 3));
           i += end + 3;
@@ -840,8 +848,8 @@ function renderInline(src, ctx) {
     if (ch === '*' || ch === '_' || ch === '~') {
       let run = 0;
       while (src[i] === ch) { run += 1; i += 1; }
-      if (ch === '~' && run === 1 && false) {
-        buf += '~';
+      if (ch === '~' && run >= 3) {
+        buf += '~'.repeat(run);
         continue;
       }
       const nextCh = i < n ? src[i] : undefined;
@@ -868,8 +876,8 @@ function renderInline(src, ctx) {
     // GFM extended autolinks in plain text
     if (!ctx.noAutolink && !ctx.inLink) {
       const rest = src.slice(i);
-      const boundary = prev === undefined || /[\s(\[{*"'`]/.test(prev) || prev === '\n';
-      if (boundary && (rest.startsWith('http://') || rest.startsWith('https://') || rest.startsWith('www.'))) {
+      const boundary = prev === undefined || /[\s(\[{*"'`<]/.test(prev) || prev === '\n';
+      if (boundary && (/^https?:\/\//i.test(rest) || rest.startsWith('www.'))) {
         const m = BARE_URL_AT.exec(rest);
         if (m) {
           const url = trimBareUrl(m[0]);
@@ -886,11 +894,33 @@ function renderInline(src, ctx) {
         !/[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~.@\/-]/.test(prev)
       ) {
         if (/[a-zA-Z0-9]/.test(ch)) {
+          const rest2 = rest;
+          const pm = /^(?:mailto|xmpp):/.exec(rest2);
+          if (pm) {
+            const em = BARE_EMAIL_AT.exec(rest2.slice(pm[0].length));
+            if (em) {
+              let full = pm[0] + em[0];
+              let endAt = full.length;
+              if (pm[0] === 'xmpp:' && rest2[endAt] === '/') {
+                const rm = /^\/[a-zA-Z0-9@._~+-]+/.exec(rest2.slice(endAt));
+                if (rm) { full += rm[0]; endAt += rm[0].length; }
+              }
+              const after = rest2[endAt];
+              if (after !== '-' && after !== '_') {
+                pushRaw('<a href="' + escapeAttr(cleanUrl(full)) + '">' + escapeText(full) + '</a>');
+                i += endAt;
+                continue;
+              }
+            }
+          }
           const m = BARE_EMAIL_AT.exec(rest);
           if (m && m[0].length > 3) {
-            pushRaw('<a href="mailto:' + escapeAttr(m[0]) + '">' + escapeText(m[0]) + '</a>');
-            i += m[0].length;
-            continue;
+            const after = rest[m[0].length];
+            if (after !== '-' && after !== '_') {
+              pushRaw('<a href="mailto:' + escapeAttr(m[0]) + '">' + escapeText(m[0]) + '</a>');
+              i += m[0].length;
+              continue;
+            }
           }
         }
       }
@@ -992,8 +1022,11 @@ function htmlBlockType(rest) {
   if (rest.startsWith('<![CDATA[')) return 5;
   const m = /^<\/?([a-zA-Z][a-zA-Z0-9-]*)(?=[\s>]|\/>|$)/.exec(rest);
   if (m && BLOCK_TAGS.has(m[1].toLowerCase())) return 6;
-  const m7 = /^<\/?([a-zA-Z][a-zA-Z0-9-]*)(?:[ \t]+[a-zA-Z_:][a-zA-Z0-9_.:-]*(?:[ \t]*=[ \t]*(?:[^ \t"'=<>\`]+|'[^']*'|"[^"]*"))?)*[ \t]*\/?>[ \t]*$/.exec(rest);
-  if (m7 && !BLOCK_TAGS.has(m7[1].toLowerCase())) return 7;
+  if (rest.startsWith('</')) {
+    const mc = /^<\/([a-zA-Z][a-zA-Z0-9-]*)[ \t]*>[ \t]*$/.exec(rest);
+    return mc ? 7 : 0;
+  }
+  const m7 = /^<([a-zA-Z][a-zA-Z0-9-]*)(?:[ \t]+[a-zA-Z_:][a-zA-Z0-9_.:-]*(?:[ \t]*=[ \t]*(?:[^ \t"'=<>\`]+|'[^']*'|"[^"]*"))?)*[ \t]*\/?>[ \t]*$/.exec(rest);
   if (m7) return 7;
   return 0;
 }
@@ -1077,20 +1110,36 @@ function splitRow(line) {
   while (i < s.length) {
     const ch = s[i];
     if (ch === '\\' && s[i + 1] === '|') {
-      cur += '\\|';
+      cur += '|';
       i += 2;
       continue;
     }
     if (ch === '`') {
+      // a backtick run only shields pipes when it actually closes here
       let run = 0;
-      while (s[i] === '`') { run += 1; i += 1; cur += '`'; }
-      while (i < s.length) {
-        if (s[i] === '`') {
+      let j = i;
+      while (s[j] === '`') { run += 1; j += 1; }
+      let closeAt = -1;
+      for (let k = j; k < s.length; k++) {
+        if (s[k] === '`') {
           let r2 = 0;
-          while (s[i] === '`') { r2 += 1; i += 1; cur += '`'; }
-          if (r2 === run) break;
-        } else { cur += s[i]; i += 1; }
+          let k2 = k;
+          while (s[k2] === '`') { r2 += 1; k2 += 1; }
+          if (r2 === run) { closeAt = k; break; }
+          k = k2 - 1;
+        }
       }
+      if (closeAt < 0) {
+        cur += '`'.repeat(run);
+        i = j;
+        continue;
+      }
+      cur += s.slice(i, closeAt).replace(/\\\|/g, '|');
+      let r2 = 0;
+      let e = closeAt;
+      while (s[e] === '`') { r2 += 1; e += 1; }
+      cur += '`'.repeat(r2);
+      i = e;
       continue;
     }
     if (ch === '|') {
@@ -1180,12 +1229,8 @@ function renderBlocks(lines, ctx) {
           content.push(stripIndent(l2, ind.cols));
           i += 1;
         }
-        // Collapse a run of trailing blank lines in the content to one.
-        while (
-          content.length > 1 &&
-          content[content.length - 1] === '' &&
-          content[content.length - 2] === ''
-        ) content.pop();
+        // One trailing blank line of fence content is dropped.
+        if (content.length && content[content.length - 1] === '') content.pop();
         const codeText = content.length ? content.join('\n') + '\n' : '';
         html += '<pre><code' +
           (lang ? ' class="language-' + escapeAttr(lang) + '"' : '') +
@@ -1310,7 +1355,10 @@ function renderBlocks(lines, ctx) {
       // last line, unless a blank line follows. Blank-line-closed blocks
       // only gain one at the very end of the top-level document.
       const nextBlank = i < n && isBlank(lines[i]);
-      html += buf.join('\n') + ((ht <= 5 && !nextBlank) || (ht >= 6 && ctx.top && !hitBlank && i >= n) ? '\n' : '');
+      const addNl = ht <= 5
+        ? !nextBlank && (i < n || ctx.eofNewline)
+        : ctx.top && !hitBlank && i >= n && ctx.eofNewline;
+      html += buf.join('\n') + (addNl ? '\n' : '');
       continue;
     }
 
@@ -1354,7 +1402,6 @@ function renderBlocks(lines, ctx) {
       while (i < n) {
         const l2 = lines[i];
         if (isBlank(l2)) break;
-        if (!l2.includes('|')) break;
         if (interruptsParagraph(lines, i, ctx)) break;
         rows.push(splitRow(l2));
         i += 1;
@@ -1388,7 +1435,7 @@ function renderTable(headerCells, aligns, rows, ctx) {
   headerCells.forEach((c, k) => { html += cellHtml('th', c, aligns[k]); });
   html += '</tr>\n</thead>\n';
   if (rows.length) {
-    html += '<tbody>\n';
+    html += '<tbody>';
     for (const row of rows) {
       html += '<tr>\n';
       for (let k = 0; k < headerCells.length; k++) {
@@ -1396,9 +1443,10 @@ function renderTable(headerCells, aligns, rows, ctx) {
       }
       html += '</tr>\n';
     }
-    html += '</tbody>\n';
+    html += '</tbody></table>\n';
+  } else {
+    html += '</table>\n';
   }
-  html += '</table>\n';
   return html;
 }
 
@@ -1604,9 +1652,10 @@ export function parse(markdown) {
     .replace(/\r\n?/g, '\n');
   const lines = src.split('\n');
   // A trailing newline produces a phantom empty final line; drop it so it
-  // cannot be mistaken for content.
-  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+  // cannot be mistaken for content, but remember that it was there.
+  const eofNewline = lines.length > 0 && lines[lines.length - 1] === '';
+  if (eofNewline) lines.pop();
   const refs = new Map();
   prescanDefs(lines, refs);
-  return renderBlocks(lines, { refs, tight: false, top: true });
+  return renderBlocks(lines, { refs, tight: false, top: true, eofNewline });
 }
