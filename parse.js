@@ -38,7 +38,9 @@ function escapeCode(s) {
   return s
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // Escape for double-quoted attribute values (same rules as text).
@@ -177,7 +179,11 @@ function isBlank(line) {
 /* ------------------------------------------------------------------ */
 
 function normalizeLabel(label) {
-  return label.replace(/\s+/g, ' ').trim().toLowerCase();
+  return label
+    .replace(/\\([!-\/:-@\[-`{-~])/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
 }
 
 // Parse a destination starting at src[pos]: <angle> or bare-with-parens.
@@ -258,65 +264,72 @@ function tryParseDef(lines, i) {
   const ind = indentInfo(first, 4);
   if (ind.cols >= 4) return null;
   const rest0 = first.slice(ind.pos);
-  const m = /^\[([^\]]+)\]:/.exec(rest0);
-  if (!m) return null;
-  const label = m[1];
-  if (!label.trim()) return null;
-  // Work over a virtual string made of this line plus up to two followers,
-  // remembering which physical line each position belongs to.
-  let text = rest0.slice(m[0].length);
-  let extra = 0;
-  const totalText = () => {
-    let t = text;
-    for (let k = 1; k <= extra; k++) t += '\n' + lines[i + k];
-    return t;
-  };
-  let pos = skipInlineWs(text, 0);
-  if (pos >= text.length && i + 1 < lines.length) {
-    extra = 1;
-    text = totalText();
-    pos = skipInlineWs(text, 0);
+  if (rest0[0] !== '[') return null;
+  // Work over the first line joined with up to eleven followers: labels,
+  // destinations and titles may each live on their own line, and titles
+  // may span several lines.
+  let text = rest0;
+  let joined = 0;
+  while (joined < 11 && i + joined + 1 < lines.length) {
+    joined += 1;
+    text += '\n' + lines[i + joined];
   }
+  // Label: up to the first unescaped ']', which must be followed by ':'.
+  let pos = 1;
+  let label = '';
+  let labelClosed = false;
+  while (pos < text.length) {
+    const c = text[pos];
+    if (c === '\\' && pos + 1 < text.length) {
+      label += c + text[pos + 1];
+      pos += 2;
+      continue;
+    }
+    if (c === '[') return null;
+    if (c === ']') { labelClosed = true; break; }
+    label += c;
+    pos += 1;
+  }
+  if (!labelClosed || !label.trim()) return null;
+  if (/\n[ \t]*\n/.test(label)) return null;
+  if (text[pos + 1] !== ':') return null;
+  pos += 2;
+  const destWsEnd = skipInlineWs(text, pos);
+  if (/\n[ \t]*\n/.test(text.slice(pos, destWsEnd))) return null;
+  pos = destWsEnd;
   const dest = parseDestAt(text, pos);
   if (!dest) return null;
   pos = dest.next;
-  // Optional title: must be separated from the destination.
+  // Optional title, separated from the destination by whitespace
+  // (possibly just the newline before a title-only line).
   let title = null;
-  const afterDest = pos;
-  pos = skipInlineWs(text, pos);
-  const hadWs = pos > afterDest;
-  if (pos >= text.length && extra === 0 && i + 1 < lines.length) {
-    // title may live entirely on the next line
-    const peek = totalText.call(null) ;
-  }
-  if (hadWs && pos < text.length && (text[pos] === '"' || text[pos] === "'" || text[pos] === '(')) {
-    const t = parseTitleAt(text, pos);
+  const wsEnd = skipInlineWs(text, pos);
+  if (
+    wsEnd > pos &&
+    !/\n[ \t]*\n/.test(text.slice(pos, wsEnd)) &&
+    wsEnd < text.length &&
+    (text[wsEnd] === '"' || text[wsEnd] === "'" || text[wsEnd] === '(')
+  ) {
+    const t = parseTitleAt(text, wsEnd);
     if (t) {
       title = t.title;
       pos = t.next;
     }
-  } else if (hadWs && pos >= text.length && i + extra + 1 < lines.length) {
-    const joined = text + '\n' + lines[i + extra + 1];
-    const p2 = skipInlineWs(joined, afterDest);
-    if (p2 < joined.length && (joined[p2] === '"' || joined[p2] === "'" || joined[p2] === '(')) {
-      const t = parseTitleAt(joined, p2);
-      if (t) {
-        title = t.title;
-        text = joined;
-        extra += 1;
-        pos = t.next;
-      }
-    }
   }
-  pos = skipInlineWs(text, pos);
-  if (pos < text.length) {
-    // Trailing junk on the final line invalidates the definition — unless
-    // the junk is on a line of its own, in which case this def only spans
-    // the lines before it and the title attempt above was speculative.
-    const nl = text.lastIndexOf('\n', pos - 1);
-    return null;
+  // Only blanks may follow on the definition's final line. If junk follows
+  // a speculative title, drop the title and re-check at the destination.
+  let end = pos;
+  while (end < text.length && (text[end] === ' ' || text[end] === '\t')) end += 1;
+  if (end < text.length && text[end] !== '\n') {
+    if (title === null) return null;
+    title = null;
+    end = dest.next;
+    while (end < text.length && (text[end] === ' ' || text[end] === '\t')) end += 1;
+    if (end < text.length && text[end] !== '\n') return null;
   }
-  return { label, href: dest.href, title, lines: 1 + extra };
+  const consumed = text.slice(0, end).split('\n').length;
+  if (consumed > joined + 1) return null;
+  return { label, href: dest.href, title, lines: consumed };
 }
 
 function registerDef(refs, def) {
@@ -1064,7 +1077,7 @@ function renderBlocks(lines, ctx) {
           let j = i;
           while (j < n && isBlank(lines[j])) j += 1;
           if (j < n && indentInfo(lines[j], 4).cols >= 4) {
-            for (let k = i; k < j; k++) content.push('');
+            for (let k = i; k < j; k++) content.push(stripIndent(lines[k], 4));
             i = j;
             continue;
           }
@@ -1074,7 +1087,7 @@ function renderBlocks(lines, ctx) {
         content.push(stripIndent(l2, 4));
         i += 1;
       }
-      while (content.length && content[content.length - 1] === '') content.pop();
+      while (content.length && /^[ \t]*$/.test(content[content.length - 1])) content.pop();
       html += '<pre><code>' + escapeCode(content.join('\n') + '\n') + '</code></pre>\n';
       continue;
     }
@@ -1085,7 +1098,7 @@ function renderBlocks(lines, ctx) {
       let content = am[2] || '';
       content = content.replace(/[ \t]+$/, '');
       if (/^#+$/.test(content)) content = '';
-      else content = content.replace(/[ \t]#+$/, '');
+      else content = content.replace(/[ \t]#+$/, '').replace(/[ \t]+$/, '');
       html += '<h' + am[1].length + '>' +
         renderInline(content, { refs: ctx.refs }) +
         '</h' + am[1].length + '>\n';
@@ -1113,9 +1126,10 @@ function renderBlocks(lines, ctx) {
           i += 1;
           continue;
         }
-        // lazy continuation: previous inner line is paragraph-ish text
+        // lazy continuation: previous inner line is paragraph-ish text and
+        // the line could actually continue a paragraph
         const lastInner = inner[inner.length - 1];
-        if (lastInner !== undefined && !isBlank(lastInner) && inner.length > 0) {
+        if (lastInner !== undefined && !isBlank(lastInner) && inner.length > 0 && !interruptsParagraph(lines, i, ctx)) {
           inner.push(l2);
           i += 1;
           continue;
@@ -1139,6 +1153,7 @@ function renderBlocks(lines, ctx) {
     const ht = htmlBlockType(rest);
     if (ht >= 1) {
       const buf = [];
+      let hitBlank = false;
       if (ht === 1) {
         const tag = /^<([a-zA-Z]+)/.exec(rest)[1].toLowerCase();
         const closeRe = new RegExp('</' + tag + '\\s*>', 'i');
@@ -1158,13 +1173,16 @@ function renderBlocks(lines, ctx) {
         while (i < n) { buf.push(lines[i]); const d = lines[i].includes(']]>'); i += 1; if (d) break; }
       } else {
         while (i < n && !isBlank(lines[i])) { buf.push(lines[i]); i += 1; }
+        hitBlank = i < n;
       }
-      html += buf.join('\n') + '\n';
+      // A block closed by its own terminator keeps a trailing newline;
+      // one closed off by a blank line does not gain one.
+      html += buf.join('\n') + (ht === 1 || (ht >= 6 && !hitBlank && i >= n) ? '\n' : '');
       continue;
     }
 
-    // table / setext / paragraph
-    const paraLines = [stripIndent(line, Math.min(ind.cols, 3))];
+    // table / setext / paragraph — paragraph lines keep their raw text
+    const paraLines = [line];
     i += 1;
     let headingLevel = 0;
     let tableAligns = null;
@@ -1193,7 +1211,7 @@ function renderBlocks(lines, ctx) {
         }
       }
       if (interruptsParagraph(lines, i, ctx)) break;
-      paraLines.push(stripIndent(l2, Math.min(ind2.cols, 3)));
+      paraLines.push(l2);
       i += 1;
     }
 
@@ -1212,10 +1230,13 @@ function renderBlocks(lines, ctx) {
       continue;
     }
 
-    const text = paraLines.join('\n');
+    const text = paraLines.join('\n').replace(/[ \t]+$/, '');
     if (headingLevel) {
+      const htext = paraLines
+        .map((l) => stripIndent(l, Math.min(indentInfo(l, 4).cols, 3)).replace(/[ \t]+$/, ''))
+        .join('\n');
       html += '<h' + headingLevel + '>' +
-        renderInline(text, { refs: ctx.refs }) +
+        renderInline(htext, { refs: ctx.refs }) +
         '</h' + headingLevel + '>\n';
     } else if (ctx.tight) {
       html += renderInline(text, { refs: ctx.refs });
@@ -1250,6 +1271,12 @@ function renderTable(headerCells, aligns, rows, ctx) {
 
 const BLOCK_CLOSE_RE = /\/(?:ul|ol|blockquote|pre|table|p|h[1-6]|li)>$|<hr>$/;
 
+function isHrLine(line) {
+  const ind = indentInfo(line, 4);
+  if (ind.cols >= 4) return false;
+  return HR_RE.test(line.slice(ind.pos));
+}
+
 function renderList(lines, start, ctx) {
   const first = matchListMarker(lines[start]);
   const ordered = first.ordered;
@@ -1265,6 +1292,7 @@ function renderList(lines, start, ctx) {
     (ordered ? mk.delim === delim : mk.bullet === bullet);
 
   while (i < lines.length) {
+    if (items.length > 0 && isHrLine(lines[i])) break;
     const mk = matchListMarker(lines[i]);
     if (!sameMarker(mk)) break;
     const contentCols = mk.contentCols;
@@ -1282,7 +1310,7 @@ function renderList(lines, start, ctx) {
         while (j < lines.length && isBlank(lines[j])) j += 1;
         const blanks = j - i;
         if (j >= lines.length) { i = j; endedByBlankRun = true; break; }
-        const nextMk = matchListMarker(lines[j]);
+        const nextMk = isHrLine(lines[j]) ? null : matchListMarker(lines[j]);
         const nextInd = indentInfo(lines[j], 4);
         if (sameMarker(nextMk) && nextMk.indentCols < contentCols) {
           if (blanks >= 1) loose = true;
@@ -1307,7 +1335,7 @@ function renderList(lines, start, ctx) {
         break;
       }
       const ind2 = indentInfo(l2, 4);
-      const mk2 = matchListMarker(l2);
+      const mk2 = isHrLine(l2) ? null : matchListMarker(l2);
       if (sameMarker(mk2) && mk2.indentCols < contentCols && ind2.cols < contentCols) {
         break; // next item
       }
@@ -1318,7 +1346,7 @@ function renderList(lines, start, ctx) {
       }
       // lazy continuation of the item's paragraph
       const lastItem = itemLines[itemLines.length - 1];
-      if (lastItem !== undefined && !isBlank(lastItem) && !itemBlankSeen) {
+      if (lastItem !== undefined && !isBlank(lastItem) && !itemBlankSeen && !interruptsParagraph(lines, i, ctx)) {
         itemLines.push(l2);
         i += 1;
         continue;
@@ -1329,6 +1357,7 @@ function renderList(lines, start, ctx) {
     if (endedByBlankRun) break;
     // continue while next line is another item marker
     if (i < lines.length) {
+      if (isHrLine(lines[i])) break;
       const nmk = matchListMarker(lines[i]);
       if (!sameMarker(nmk)) break;
     }
