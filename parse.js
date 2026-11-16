@@ -79,21 +79,27 @@ function cleanUrl(href) {
 function indentInfo(line, limit) {
   let col = 0;
   let pos = 0;
-  while (pos < line.length) {
+  let full = 0;
+  let p2 = 0;
+  while (p2 < line.length) {
+    const ch = line[p2];
+    if (ch === ' ') { full += 1; p2 += 1; }
+    else if (ch === '\t') { full += 4 - (full % 4); p2 += 1; }
+    else break;
+  }
+  while (pos < line.length && col < limit) {
     const ch = line[pos];
     if (ch === ' ') {
-      if (col >= limit) break;
       col += 1;
       pos += 1;
     } else if (ch === '\t') {
-      if (col >= limit) break;
       col += 4 - (col % 4);
       pos += 1;
     } else {
       break;
     }
   }
-  return { cols: col, pos };
+  return { cols: full, pos };
 }
 
 // Remove up to `cols` columns of indentation. Absolute tab stops are
@@ -311,7 +317,7 @@ function tryParseDef(lines, i) {
     (text[wsEnd] === '"' || text[wsEnd] === "'" || text[wsEnd] === '(')
   ) {
     const t = parseTitleAt(text, wsEnd);
-    if (t) {
+    if (t && !/\n[ \t]*\n/.test(text.slice(wsEnd, t.next))) {
       title = t.title;
       pos = t.next;
     }
@@ -339,30 +345,74 @@ function registerDef(refs, def) {
   }
 }
 
+// Strip every layer of blockquote markers from a line (used by the
+// definition pre-scan to see inside quotes).
+function quoteStripAll(line) {
+  let cur = line;
+  for (let depth = 0; depth < 8; depth++) {
+    const ind = indentInfo(cur, 4);
+    if (ind.cols >= 4 || cur[ind.pos] !== '>') return cur;
+    cur = stripQuoteMarker(cur);
+  }
+  return cur;
+}
+
 // Pre-scan: definitions are visible to links that precede them, so gather
-// top-level definitions up front (skipping fenced code regions).
+// top-level definitions up front (skipping fenced code regions). A
+// definition-shaped line that merely continues a paragraph does not
+// count, so paragraph state is tracked while scanning.
 function prescanDefs(lines, refs) {
   let inFence = null;
+  let prevPara = false;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    if (isBlank(line)) { prevPara = false; continue; }
     const ind = indentInfo(line, 4);
     const rest = ind.cols < 4 ? line.slice(ind.pos) : '';
     const fm = /^(`{3,}|~{3,})/.exec(rest);
     if (inFence) {
       if (fm && fm[1][0] === inFence.ch && fm[1].length >= inFence.len) inFence = null;
+      prevPara = false;
       continue;
     }
     if (fm && !(fm[1][0] === '`' && rest.slice(fm[1].length).includes('`'))) {
       inFence = { ch: fm[1][0], len: fm[1].length };
+      prevPara = false;
       continue;
     }
-    if (rest.startsWith('[')) {
+    if (!prevPara && rest.startsWith('[')) {
       const def = tryParseDef(lines, i);
       if (def) {
         registerDef(refs, def);
         i += def.lines - 1;
+        prevPara = false;
+        continue;
       }
     }
+    if (!prevPara && rest.startsWith('>')) {
+      // definitions nested in a blockquote are visible document-wide
+      const synth = [];
+      for (let k = 0; k < 12 && i + k < lines.length; k++) {
+        synth.push(quoteStripAll(lines[i + k]));
+      }
+      if (synth[0].startsWith('[')) {
+        const def = tryParseDef(synth, 0);
+        if (def) {
+          registerDef(refs, def);
+          prevPara = false;
+          continue;
+        }
+      }
+    }
+    prevPara = !(
+      ind.cols >= 4 ||
+      ATX_RE.test(rest) ||
+      HR_RE.test(rest) ||
+      rest.startsWith('>') ||
+      htmlBlockType(rest) >= 1 ||
+      matchListMarker(line) !== null ||
+      SETEXT_RE.test(rest)
+    );
   }
 }
 
@@ -1059,6 +1109,12 @@ function renderBlocks(lines, ctx) {
           content.push(stripIndent(l2, ind.cols));
           i += 1;
         }
+        // Collapse a run of trailing blank lines in the content to one.
+        while (
+          content.length > 1 &&
+          content[content.length - 1] === '' &&
+          content[content.length - 2] === ''
+        ) content.pop();
         const codeText = content.length ? content.join('\n') + '\n' : '';
         html += '<pre><code' +
           (lang ? ' class="language-' + escapeAttr(lang) + '"' : '') +
@@ -1129,14 +1185,18 @@ function renderBlocks(lines, ctx) {
         // lazy continuation: previous inner line is paragraph-ish text and
         // the line could actually continue a paragraph
         const lastInner = inner[inner.length - 1];
-        if (lastInner !== undefined && !isBlank(lastInner) && inner.length > 0 && !interruptsParagraph(lines, i, ctx)) {
-          inner.push(l2);
+        if (
+          lastInner !== undefined && !isBlank(lastInner) && inner.length > 0 &&
+          indentInfo(lastInner, 4).cols < 4 &&
+          !interruptsParagraph(lines, i, ctx)
+        ) {
+          inner.push(stripIndent(l2, Math.min(indentInfo(l2, 4).cols, 4)));
           i += 1;
           continue;
         }
         break;
       }
-      html += '<blockquote>\n' + renderBlocks(inner, ctx) + '</blockquote>\n';
+      html += '<blockquote>\n' + renderBlocks(inner, { refs: ctx.refs, tight: false, top: false }) + '</blockquote>\n';
       continue;
     }
 
@@ -1175,9 +1235,11 @@ function renderBlocks(lines, ctx) {
         while (i < n && !isBlank(lines[i])) { buf.push(lines[i]); i += 1; }
         hitBlank = i < n;
       }
-      // A block closed by its own terminator keeps a trailing newline;
-      // one closed off by a blank line does not gain one.
-      html += buf.join('\n') + (ht === 1 || (ht >= 6 && !hitBlank && i >= n) ? '\n' : '');
+      // Blocks closed by their own terminator keep the newline of their
+      // last line, unless a blank line follows. Blank-line-closed blocks
+      // only gain one at the very end of the top-level document.
+      const nextBlank = i < n && isBlank(lines[i]);
+      html += buf.join('\n') + ((ht <= 5 && !nextBlank) || (ht >= 6 && ctx.top && !hitBlank && i >= n) ? '\n' : '');
       continue;
     }
 
@@ -1230,7 +1292,7 @@ function renderBlocks(lines, ctx) {
       continue;
     }
 
-    const text = paraLines.join('\n').replace(/[ \t]+$/, '');
+    const text = paraLines.join('\n');
     if (headingLevel) {
       const htext = paraLines
         .map((l) => stripIndent(l, Math.min(indentInfo(l, 4).cols, 3)).replace(/[ \t]+$/, ''))
@@ -1271,6 +1333,32 @@ function renderTable(headerCells, aligns, rows, ctx) {
 
 const BLOCK_CLOSE_RE = /\/(?:ul|ol|blockquote|pre|table|p|h[1-6]|li)>$|<hr>$/;
 
+// Decide whether one list item is internally loose: a blank line inside
+// it separates two of its own blocks. Blank lines that merely sit inside
+// a nested list item or blockquote do not count.
+function itemLoose(itemLines) {
+  const stack = []; // content indents of open nested containers
+  let seenBlank = false;
+  for (const l of itemLines) {
+    if (isBlank(l)) {
+      seenBlank = true;
+      continue;
+    }
+    const ind = indentInfo(l, 4).cols;
+    if (seenBlank) {
+      if (!(stack.length && ind >= stack[stack.length - 1])) return true;
+      seenBlank = false;
+    }
+    while (stack.length && ind < stack[stack.length - 1]) stack.pop();
+    const base = stack.length ? stack[stack.length - 1] : 0;
+    const rel = stripIndent(l, base);
+    const mk = matchListMarker(rel);
+    if (mk) stack.push(base + mk.contentCols);
+    else if (rel.startsWith('>')) stack.push(base + 2);
+  }
+  return false;
+}
+
 function isHrLine(line) {
   const ind = indentInfo(line, 4);
   if (ind.cols >= 4) return false;
@@ -1284,7 +1372,7 @@ function renderList(lines, start, ctx) {
   const delim = first.delim;
   const startNum = first.start;
   const items = [];
-  let loose = false;
+  let looseBetween = false;
   let i = start;
 
   const sameMarker = (mk) =>
@@ -1302,6 +1390,13 @@ function renderList(lines, start, ctx) {
     i += 1;
     let itemBlankSeen = false;
     let endedByBlankRun = false;
+    let stopAfterItem = false;
+    // An item whose first line is empty ends at once if a blank line
+    // follows: content after that blank belongs to a new block.
+    if (mk.empty && i < lines.length && isBlank(lines[i])) {
+      items.push(itemLines);
+      break;
+    }
     while (i < lines.length) {
       const l2 = lines[i];
       if (isBlank(l2)) {
@@ -1313,14 +1408,13 @@ function renderList(lines, start, ctx) {
         const nextMk = isHrLine(lines[j]) ? null : matchListMarker(lines[j]);
         const nextInd = indentInfo(lines[j], 4);
         if (sameMarker(nextMk) && nextMk.indentCols < contentCols) {
-          if (blanks >= 1) loose = true;
+          if (blanks >= 1) looseBetween = true;
           i = j;
           itemBlankSeen = true;
           break; // item ends, outer loop starts next item
         }
         if (nextInd.cols >= contentCols) {
           // blank line inside the item, more item content follows
-          loose = true;
           for (let k = 0; k < blanks; k++) itemLines.push('');
           itemBlankSeen = true;
           i = j;
@@ -1344,10 +1438,17 @@ function renderList(lines, start, ctx) {
         i += 1;
         continue;
       }
-      // lazy continuation of the item's paragraph
+      // lazy continuation of the item's paragraph — but a line that could
+      // start a list of its own (marker at a plausible position) ends the
+      // item instead of joining its paragraph
       const lastItem = itemLines[itemLines.length - 1];
-      if (lastItem !== undefined && !isBlank(lastItem) && !itemBlankSeen && !interruptsParagraph(lines, i, ctx)) {
-        itemLines.push(l2);
+      const lazyMarker = matchListMarker(l2);
+      if (
+        lastItem !== undefined && !isBlank(lastItem) && !itemBlankSeen &&
+        !interruptsParagraph(lines, i, ctx) &&
+        !(lazyMarker && indentInfo(l2, 4).cols <= 3)
+      ) {
+        itemLines.push(stripIndent(l2, Math.min(indentInfo(l2, 4).cols, 4)));
         i += 1;
         continue;
       }
@@ -1363,6 +1464,7 @@ function renderList(lines, start, ctx) {
     }
   }
 
+  const loose = looseBetween || items.some((it) => itemLoose(it));
   const tag = ordered ? 'ol' : 'ul';
   let html = '<' + tag + (ordered && startNum !== 1 ? ' start="' + startNum + '"' : '') + '>\n';
   for (const itemLines of items) {
@@ -1376,7 +1478,7 @@ function renderList(lines, start, ctx) {
         itemLines[0] = itemLines[0].slice(cm[0].length);
       }
     }
-    let body = renderBlocks(itemLines, { refs: ctx.refs, tight: !loose });
+    let body = renderBlocks(itemLines, { refs: ctx.refs, tight: !loose, top: false });
     if (checkbox) {
       if (body.startsWith('<p>')) body = '<p>' + checkbox + ' ' + body.slice(3);
       else body = checkbox + ' ' + body;
@@ -1409,5 +1511,5 @@ export function parse(markdown) {
   if (lines.length && lines[lines.length - 1] === '') lines.pop();
   const refs = new Map();
   prescanDefs(lines, refs);
-  return renderBlocks(lines, { refs, tight: false });
+  return renderBlocks(lines, { refs, tight: false, top: true });
 }
